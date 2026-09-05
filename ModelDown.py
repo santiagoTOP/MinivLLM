@@ -4,5 +4,5 @@ from modelscope.hub.snapshot_download import snapshot_download
 # 下载新模型时改 model_id 和 local_dir 即可
 snapshot_download(
     model_id="Qwen/Qwen3-0.6B",
-    local_dir="/root/autodl-tmp/models/Qwen3-0.6B",
+    local_dir="/root/autodl-tmp/Models/Qwen3-0.6B",
 )
