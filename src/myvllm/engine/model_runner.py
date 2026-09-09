@@ -23,7 +23,7 @@ class ModelRunner:
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)  # 初始化分布式通信组，等到凑够 world_size 个进程后才初始化
         torch.cuda.set_device(rank)
 
         # set model

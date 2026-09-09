@@ -15,28 +15,28 @@ def worker_process(config, rank, event):
     # FIRST print before any other code
     import sys
     import os
-    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
-    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering，方便及时打印日志
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)  # Line buffering，方便及时打印错误日志
 
-    model_runner = ModelRunner(config, rank, event)
-    model_runner.loop()
+    model_runner = ModelRunner(config, rank, event) # 初始化子进程的模型推理器
+    model_runner.loop() # 让子进行的worker进入循环等待主进程的指令
 
 
 class LLMEngine:
     def __init__(self, config: dict):
-        self.config = config
-        world_size = config.get("world_size", 1)
-        ctx = mp.get_context("spawn")
-        self.processes = []
-        self.events = []
+        self.config = config  # 模型配置文件
+        world_size = config.get("world_size", 1) # 全局进程数，主要是用于分布式推理
+        ctx = mp.get_context("spawn") # 获取 spawn 方式的多进程上下文；用它创建的子进程是全新进程，不继承父进程状态（CUDA 安全）
+        self.processes = []  # 子进程列表，方便在退出时 `join()`，避免僵尸进程
+        self.events = []  # 事件列表，用于主进程同步子进程状态，避免轮询，省 CPU 资源
         for i in range(1, world_size):
-            event = ctx.Event()
-            process = ctx.Process(target=worker_process, args=(config, i, event))
-            self.events.append(event)
-            self.processes.append(process)
-            process.start()
+            event = ctx.Event() # 主进程创建事件，用于同步子进程状态
+            process = ctx.Process(target=worker_process, args=(config, i, event)) # 创建子进程对象
+            self.events.append(event) 
+            self.processes.append(process) 
+            process.start() # 启动子进程
         # start the engine only on the master thread with rank = 0
-        self.model_runner = ModelRunner(config, rank=0, event=self.events)
+        self.model_runner = ModelRunner(config, rank=0, event=self.events) # 初始化主进程的模型推理器，这里的 event 是一个事件列表，用于主进程同步子进程状态，避免轮询，省 CPU 资源
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
         
         # scheduler needs to init after model_runner: when world_size > 1,
@@ -44,22 +44,23 @@ class LLMEngine:
         # collective barrier — rank-0 blocks until all worker ranks have joined.
         # The scheduler should only be created after that rendezvous completes.
         # When world_size == 1 there is no barrier and no real dependency.
+        # 负责决定每一步前向传播时，哪些序列、以什么方式组 batch，continuous batching的核心逻辑
         self.scheduler = Scheduler(
-            max_num_sequences=config.get("max_num_sequences", 16),
-            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
-            max_cached_blocks=config.get("max_cached_blocks", 1024),
-            block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            max_num_sequences=config.get("max_num_sequences", 16), # 最大序列数，每个 batch 最多 16 个序列
+            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024), # 控制每次前向传播的 token 数量
+            max_cached_blocks=config.get("max_cached_blocks", 1024), # 最大缓存 block 数量
+            block_size=config.get("block_size", 256), # 每个 block 的 token 数量
+            eos=config.get("eos", 50256) # 推理的结束符 token id
         )
 
-        atexit.register(self.exit)
+        atexit.register(self.exit) # 注册正常退出时的回调函数，确保所有子进程也退出
 
 
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
         for process in self.processes:
-            process.join()
+            process.join() # 等待所有子进程退出，避免僵尸进程
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling
@@ -86,7 +87,7 @@ class LLMEngine:
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
-        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
+        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'], sampling_params=sampling_params))
 
     # given a list of prompts
     # add_prompt for each prompt
