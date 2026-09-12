@@ -6,7 +6,8 @@ from copy import copy
 
 
 class SequenceStatus(Enum):
-    WAITING = auto()
+    # auto的作用是自动为每个枚举值分配一个唯一的整数，从 1 开始递增
+    WAITING = auto() 
     RUNNING = auto()
     FINISHED = auto()
 
@@ -41,7 +42,7 @@ class Sequence:
         self.temperature = sampling_params.temperature # 采样的温度参数，用于控制采样的随机性
         self.max_tokens = sampling_params.max_tokens  # 最大生成 token 数量，超过后停止采样
         self.ignore_eos = sampling_params.ignore_eos # 是否忽略 EOS token
-        self.max_model_length = sampling_params.max_model_length # 最大模型长度，超过后截断
+        self.max_model_length = sampling_params.max_model_length # 最大输入给模型长度（prompt+新生成的），超过后截断
 
     def __len__(self):
         return self.num_tokens
@@ -91,30 +92,33 @@ class Sequence:
         self.last_token = token_id  # 更新 last_token 为最新生成的 token
         self.num_tokens += 1 
 
-    def __getstate__(self): # 返回序列的当前状态，用于序列化和反序列化
+    def __getstate__(self):  # pickle 序列化时自动调用，提取需要传给 worker 的序列状态
         return (
             self.num_tokens, # 总 token 数量
             self.num_prompt_tokens, # prompt token 数量
-            self.num_cached_tokens, # 被缓存命中的 token 数量
+            self.num_cached_tokens, # 命中的前缀缓存 token 数量
             self.block_table, # 当前序列的逻辑块到 KV Cache 物理块的映射
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token # 如果是预填充序列，返回完整的 token ids 列表；否则返回最新生成的 token
+            # 尚未生成 token 时返回完整 token_ids，否则只返回最新 token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
 
-    def __setstate__(self, state): 
+    def __setstate__(self, state):
+        # pickle 反序列化时自动调用；worker 据此恢复主进程传来的本轮推理状态
         (
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
             last_token_or_ids
-        ) = state # state 为当前序列的状态
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens # 判断有没有生成 token
+        ) = state  # __getstate__() 返回并经 pickle 传来的状态元组
+        # 按是否已有生成 token 还原数据格式；此条件并非直接判断 is_prefill
+        num_completion_tokens = self.num_tokens - self.num_prompt_tokens  # 已生成的 token 数量
         if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
-            self.token_ids = last_token_or_ids # 如果是预填充序列，直接赋值完整的 token ids 列表
+            # 尚未生成 token：恢复完整 token_ids，供首次 prefill 使用
+            self.token_ids = last_token_or_ids
         else:
-            # Decode: last_token_or_ids is just the last token
-            self.token_ids = [last_token_or_ids] # 如果是解码序列，将最新生成的 token 转换为列表赋值
-        # Restore last_token attribute
-        self.last_token = self.token_ids[-1] if self.token_ids else None # 更新 last_token
+            # 已有生成 token：只恢复最新 token 的列表，供正常 decode 使用
+            # worker 不持有完整 token 历史，num_tokens 仍记录完整序列长度
+            self.token_ids = [last_token_or_ids]
+        # 根据恢复后的 token_ids 设置 last_token；空列表时为 None
+        self.last_token = self.token_ids[-1] if self.token_ids else None

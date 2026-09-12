@@ -67,18 +67,19 @@ class LLMEngine:
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
     def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
-        scheduled_sequences, is_prefill = self.scheduler.schedule()
-        num_processed_tokens = 0
-        if not scheduled_sequences:
+        scheduled_sequences, is_prefill = self.scheduler.schedule() # 调度调度器，返回待处理的序列和是否为预填充
+        num_processed_tokens = 0 # 记录被处理的 token 数量，如果是预填充，就是序列长度，否则就是 batch 大小
+        if not scheduled_sequences: # 如果没有待处理的序列，直接返回空列表
             return [], num_processed_tokens, is_prefill
         # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill) # 调用模型推理器，返回模型输出
         # Move outputs to CPU and convert them to a list
         if outputs is not None:
-            outputs = outputs.cpu().tolist()
+            outputs = outputs.cpu().tolist() # 将模型输出从 GPU 移动到 CPU 并转换为列表，tensor 转 list of list of int32
         # postprocess the outputs
-        self.scheduler.postprocess(scheduled_sequences, outputs)
+        self.scheduler.postprocess(scheduled_sequences, outputs) # 后处理模型输出，更新序列状态和缓存 block
 
+        # 当一个序列推理完成时，返回序列的序列 id 和推理生成的 token ids 列表
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
         num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
 
@@ -87,6 +88,7 @@ class LLMEngine:
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
+        # 加入等待队列，等待被调度
         self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'], sampling_params=sampling_params))
 
     # given a list of prompts
@@ -99,15 +101,19 @@ class LLMEngine:
         generated_tokens = {}
         while not self.scheduler.is_finished():
             start_t = time.time()
+            # 调用模型推理器，返回模型输出
             outputs, num_processed_tokens, is_prefill = self.step()
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
+            # 输出一下推理的速度，单位是 token/sec
             if is_prefill:
                 print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
             else:
                 print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
+            # 记录序列 id 和推理生成的 token ids 列表
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
-
+        # 按照序列 id 排序，确保与输入的 prompt 顺序一致
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
+        # 转换为文本
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output
