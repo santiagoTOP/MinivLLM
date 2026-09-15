@@ -30,7 +30,10 @@ class LLMEngine:
         self.processes = []  # 子进程列表，方便在退出时 `join()`，避免僵尸进程
         self.events = []  # 事件列表，用于主进程同步子进程状态，避免轮询，省 CPU 资源
         for i in range(1, world_size):
-            event = ctx.Event() # 主进程创建事件，用于同步子进程状态
+            # event.wait 表示正在等待主进程通知数据已经更新
+            # event.set 表示主进程通知每个子进程，开始加载数据
+            # event.clear 表示清除通知标志，等待一下次通知
+            event = ctx.Event() # 主进程创建事件，用于同步子进程状态，虽然使用的是共享内存，但是 event 的使用是为了方便主进程通知数据已经更新
             process = ctx.Process(target=worker_process, args=(config, i, event)) # 创建子进程对象
             self.events.append(event) 
             self.processes.append(process) 

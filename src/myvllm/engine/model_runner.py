@@ -14,17 +14,21 @@ from myvllm.utils import *
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
-        self.config = config
-        self.event = event
+        self.config = config # 全局配置文件涉及到模型配置、kv 缓存配置
+        self.event = event # 子进程只有一个通知事件，主进程是一个通知列表
 
         # set distributed config
-        self.block_size = config['block_size']
-        self.world_size = config['world_size']
+        self.block_size = config['block_size'] # 每个缓存块的大小
+        self.world_size = config['world_size'] # 全局有多少个并行
+        # 是否需要立即执行，设置为true表示需要立即执行，那么在 decode阶段，不会使用 cuda graph 重放，cuda graph 是每一次计算的计算图，可以存下来复用
+        # 如何设置为true表示不进行图复用直接开始执行，设置为false表示复用计算图，设置为false意味着在初始化阶段可能需要花点时间、同时还需要维护图和固定缓冲区
+        # 但是在长序列生成的时候后续的加速会抵消掉这部分耗时。
         self.enforce_eager = config.get('enforce_eager', False)
 
-        self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)  # 初始化分布式通信组，等到凑够 world_size 个进程后才初始化
-        torch.cuda.set_device(rank)
+        self.rank = rank # 可以理解为这是全局的第几个进程
+        # 初始化分布式通信组，凑够 world_size 以后才进行初始化，也就是说在整个通信组里面每个都是平等的
+        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        torch.cuda.set_device(rank) # 使用对应的 gpu
 
         # set model
         path_str = self.config['model_name_or_path']
@@ -36,15 +40,20 @@ class ModelRunner:
                     hidden_size=config['hidden_size'],
                     num_heads=config['num_heads'],
                     head_dim=config['head_dim'],
+                    # scale 是用来调整注意力权重的，scale为1表示标准的注意力缩放，scale 大于 1 表示注意力权重集中在高分部分，scale 越小表示注意力越平均
                     scale=config['scale'],
                     num_kv_heads=config['num_kv_heads'],
+                    # rmsnorm 归一化时使用的参数
                     rms_norm_epsilon=config['rms_norm_epsilon'],
                     qkv_bias=config['qkv_bias'],
+                    # 用来调整位置编码的频率
                     base=config['base'],
+                    # 模型运行的可接受的最大序列长度，这个和位置编码有关系，因此扩展这个的长度需要 base 的配合来保证长序列的效果
                     max_position=config['max_position'],
                     intermediate_size=config['intermediate_size'],
                     ffn_bias=config['ffn_bias'],
                     num_layers=config['num_layers'],
+                    # 表示语言头是否和Embedding 权重实现共享，节约显存
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
                 )
@@ -69,27 +78,42 @@ class ModelRunner:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
-        self.model = self.model.cuda(rank)
+        self.model = self.model.cuda(rank) # 将模型运行在对应的 gpu 上
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
+            # 这里需要深入理解模型原始的架构以及当前推理框架的模型架构的体现形式
             from myvllm.utils.loader import load_weights_from_checkpoint
             load_weights_from_checkpoint(self.model, config['model_name_or_path'])
 
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
-
+        
+        # 构建一个采样器，根据输出的 logits 和温度为每条序列采样出下一个 token
         self.sampler = SamplerLayer()
 
         # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
+        self.default_dtype = torch.get_default_dtype() # 保存当前全局默认的数据类型
 
         # Debug flag for first decode step
-        self._first_decode = False
+        self._first_decode = False # 预留的首次 decode 调试标记，目前没有使用
 
         # warm up model so that we know peak memory usage
-        self.warmup_model()
+        self.warmup_model() # 记录在预填充阶段的最大显存占用，方便用于后续的的 kv 缓存块的分配
         # allocate kv cache
+        """
+        KV Cache 显存预算 = warmup 清理后的空闲显存 × 利用率 - (峰值占用 - 当前占用)
+        峰值与当前占用之差用于估计推理临时显存；空闲显存已排除模型等现有占用
+        
+        GPU 总显存：      24 GB
+        当前占用：        6 GB（包含模型等）
+        当前空闲：        18 GB
+        试跑峰值：        10 GB
+        显存利用率：      0.9
+
+        临时显存估计 = 10 − 6 = 4 GB
+        KV Cache 预算 = 18 × 0.9 − 4 = 12.2 GB
+        """
         self.allocate_kv_cache()
         # capture cuda graph for decoding
         if not self.enforce_eager:
@@ -184,14 +208,15 @@ class ModelRunner:
     # run empty sequence to warm up the model
     # clear memory
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
-        max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        torch.cuda.empty_cache() # 清理未使用的显存缓存
+        torch.cuda.reset_peak_memory_stats() # 重新记录显存峰值
+        max_tokens = self.config['max_num_batch_tokens'] # 获取每次推理的最大token 数量
+        max_model_length = self.config['max_model_length'] # 获取模型最大的输入token 数量
+        batch_size = max_tokens // max_model_length # 计算在满配情况下的batch size 大小
+        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)] # 模拟构建满配的输入序列
+        # 准备输入 → 模型前向 → 语言头计算 logits → rank 0 采样
         self.run(seqs, is_prefill=True)
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache() # 释放试跑以后的显存缓存
 
     # allocate kv cache memory blocks for model
     def allocate_kv_cache(self):
