@@ -372,16 +372,22 @@ class ModelRunner:
                         slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
                     else:
                         slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
-        if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
+        # cu_seqlens_q 表示本轮实际需要计算的 token 总数，不包含缓存前缀
+        # cu_seqlens_k 表示的是当前输入序列的完整长度
+        if cu_seqlens_q[-1] < cu_seqlens_k[-1]: # 表示当前的序列中存在一条序列命中了缓存，说明至少有一条序列的推理需要前缀，因此需要将整个块表传递过去
+            # 进入当前分支构建block_tables，告诉注意力层历史 kv 存在哪些物理块中
             # pad block_tables
             all_block_tables = [seq.block_table for seq in seqs]
-            max_num_blocks = max(len(bt) for bt in all_block_tables)
+            max_num_blocks = max(len(bt) for bt in all_block_tables) # 获取当前序列中哪个序列需要的 block 最多
             for i, seq in enumerate(seqs):
-                block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
-                block_tables.append(block_table)
+                block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table)) # pad 将所有的序列 block padding 到一样长
+                block_tables.append(block_table) # 主要是padding 打包
+        # pin_memory=true 表示在 cpu 的页锁定内存中创建 tensor
+        # non blocking 表示 尽量不让 cpu 等待 gpu 复制完成，避免阻塞
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-
+        
+        # 封装为一个 contex 对象，方便后续模型各层知道如何处理这批数据
         set_context(
             is_prefill=True,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
