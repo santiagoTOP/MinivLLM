@@ -37,7 +37,7 @@ class Sequence:
         # block_table
         # 当前序列的逻辑块到 KV Cache 物理块的映射：
         # 下标为逻辑块编号，元素为物理块 ID；分配缓存块时填充。
-        self.block_table = []
+        self.block_table = [] # 存下当前序列所需要的物理块
         # sampling_params' related things
         self.temperature = sampling_params.temperature # 采样的温度参数，用于控制采样的随机性
         self.max_tokens = sampling_params.max_tokens  # 最大生成 token 数量，超过后停止采样
