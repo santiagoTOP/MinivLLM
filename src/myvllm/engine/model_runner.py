@@ -403,17 +403,21 @@ class ModelRunner:
 
     # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
-        input_ids = []
-        context_lens = []   
-        slot_mappings = []  
+        input_ids = [] # 本次推理解码的输入token，不包括缓存
+        context_lens = [] # 每个序列的完整状态，包括已命中的前缀
+        slot_mappings = [] # 存储每个序列最后一个 token的物理缓存槽，这里的最后一个token 就是上一轮生成的，一轮每条序列产生一个 token
         block_tables = []
         for seq in seqs:
             input_ids.append(seq.last_token)
             context_lens.append(len(seq))
+            # slot = 物理块编号 × 每块容量 + 块内偏移
+            # 为每条序列的最后一个 token，计算它的 kv 应写入的物理缓存块
             slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         all_block_tables = [seq.block_table for seq in seqs]
         max_num_blocks = max(len(bt) for bt in all_block_tables)
         for i, seq in enumerate(seqs):
+            # padding 所有的 block table 到一致长度，方便 tensor
+            # 严格来说每次推理解码，每条序列都应该只有一个，但是有些时候可能新调度了一个序列，这个时候就不一致了
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
@@ -431,6 +435,7 @@ class ModelRunner:
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
+        # 每个序列都有自己的采样参数，将这些参数 tensor 化，方便后续的使用
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
     # when prefilling, directly compute model forward + logits
@@ -439,28 +444,29 @@ class ModelRunner:
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill or self.enforce_eager:
+        if is_prefill or self.enforce_eager: # 如果是预填充，或者强制 eager 执行
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            hidden_states = self.model(input_ids)
-            logits = self.model.compute_logits(hidden_states)
+            hidden_states = self.model(input_ids) # 前向传播，得到 hidden states
+            logits = self.model.compute_logits(hidden_states) # 计算 logits
         else:
-            bs = input_ids.size(0)
-            context = get_context()
+            # 本质上是一个加速前向传播的机制
+            bs = input_ids.size(0) # 批量大小
+            context = get_context() # 获取上下文
 
             # finds smallest captured graph that fits the batch size
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
-            vars = self.graph_vars
+            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)] # 找到第一个能容纳当前批量大小的 graph
+            vars = self.graph_vars # 获取 graph 变量
             # copy input data into graph variables
-            vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
-            vars['slot_mapping'][:bs].copy_(context.slot_mapping)
-            vars["context_lens"].zero_()
-            vars['context_lens'][:bs].copy_(context.context_lens)
-            vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            vars['input_ids'][:bs].copy_(input_ids) # 复制输入 token 到 graph 变量
+            vars['slot_mapping'][:bs].fill_(-1) # 填充 slot mapping 为 -1，表示没有物理缓存槽
+            vars['slot_mapping'][:bs].copy_(context.slot_mapping) # 复制上下文中的 slot mapping 到 graph 变量
+            vars["context_lens"].zero_() # 填充 context lens 为 0，表示没有物理缓存槽
+            vars['context_lens'][:bs].copy_(context.context_lens) # 复制上下文中的 context lens 到 graph 变量
+            vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables # 复制上下文中的 block table 到 graph 变量
             # replay the graph
-            graph.replay()
-            logits = self.model.compute_logits(vars['outputs'][:bs])
+            graph.replay() # 执行 graph 变量中的操作，得到 logits
+            logits = self.model.compute_logits(vars['outputs'][:bs]) # 计算 logits
 
         return logits
 
@@ -471,16 +477,16 @@ class ModelRunner:
     # sample logits
     # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if is_prefill:
+        if is_prefill: # 判断是否是预填充
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, is_prefill)
+        logits = self.run_model(input_ids, is_prefill) # 前向传播，得到 logits
         # only sample when rank == 0
         token_ids = None
-        if self.rank == 0:
+        if self.rank == 0: # 只有 rank == 0 才需要采样，其他子进程直接返回 None，后续等主进程通知
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
-        reset_context()
+        reset_context() # 重置上下文，准备下一次采样
         return token_ids
 
     # capture the CUDA graph:
@@ -491,28 +497,41 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
-        max_len = self.config['max_model_length']
-        max_num_blocks = math.ceil(max_len / self.block_size)
+        max_bs = self.config['max_num_seqs'] # 模型可以同时处理多少条序列最多
+        max_len = self.config['max_model_length'] # 模型最大可以接受的token 数量，单条序列
+        max_num_blocks = math.ceil(max_len / self.block_size) # 计算最长序列最多占用多少个kv cache块
         # for decoding, input is always of shape (batch_size, 1)
+        # 在当前 rank 对应的 GPU 上创建固定输入缓冲区。每个元素是一条序列本轮输入的 token ID，初值为 0。
         input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # for paged attention
         # where to write new KV values in the cache
+        # 为每条序列留一个物理槽位编号。注意力层据此把当前 token 的 K/V 写进 KV Cache。
         slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # how many tokens each sequence has processed
+        # 为每条序列留一个上下文长度。decode 注意力用它决定读取多少历史 K/V；模型也用它计算当前位置。
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
+        # 创建二维块表：每一行属于一条序列，每一列记录一个逻辑块对应的物理 KV Cache 块编号。
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        # 创建固定输出缓冲区。这里用 vocab_size 作为第二维；按当前模型的返回值，它应容纳宽度为 hidden_size 的 hidden states。两者通常不同，因此这是形状错误。
+        # outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        outputs = torch.zeros(max_bs, self.config['hidden_size'], device=f'cuda:{self.rank}')
 
         # graphs to be captured for different batch sizes
+        # 选择批大小 1、2、4、8，以及从 16 开始每隔 16 的批大小。例如 max_bs=32，得到 [1, 2, 4, 8, 16, 32]
+        # 这里有个边界问题：max_bs=20 时，列表最大只到 16，没有能处理 17–20 条序列的图。
+        # 目前代码不会自动降级处理。max_bs=20 时只会录制 [1, 2, 4, 8, 16] 这几张图；如果实际 decode 批量达到 17–20
+        # 找不到满足 bs_ >= bs 的图，next(...) 会抛出 StopIteration，本轮推理中断。
+        # 它也不能用 16 的图处理 20 条序列，因为图的输入形状固定。需要额外录制一张能容纳 20 条序列的图，或在找不到图时走普通前向计算。
         batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # 建立字典，之后用批大小作键、对应的 CUDA Graph 作值
         self.graphs = {}
+        # 尚未取得图的内存池。后面捕获的图会使用这个池，以便共享图所需的内存分配。
         graph_pool = None
 
         for batch_size in reversed(batch_sizes):
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph() # 创建一个空图对象，准备把 GPU 操作录进去。
             set_context(
                 is_prefill=False,
                 cu_seqlens_q=None,
@@ -524,22 +543,28 @@ class ModelRunner:
                 block_tables=block_tables[:batch_size],
             )
             outputs[:batch_size] = self.model(input_ids[:batch_size])
-
+            
+            # 开始捕获区域；区域内发起的 GPU 操作会被记录到 graph 中
             with torch.cuda.graph(graph, graph_pool):
+                # 再运行模型前向，并把模型结果复制到固定的 outputs 切片；这些 GPU 操作属于被捕获的图。
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
                 if graph_pool is None:
+                    # 仅在第一次捕获时执行下面的赋值
                     graph_pool = graph.pool()
             # store the captured graph
             self.graphs[batch_size] = graph
 
             # make sure that the capture is done before resetting and next capture
+            # 等待当前 GPU 上已提交的工作完成，再进入下一轮捕获。
             torch.cuda.synchronize()
+            # 清掉 Python 侧的当前上下文，避免下一种批大小沿用它。已捕获图使用的张量地址仍由固定缓冲区保留。
             reset_context()
-
+        
+        # 建立一个字典，集中保存所有固定缓冲区。
         self.graph_vars = dict(
-            input_ids=input_ids,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
+            input_ids=input_ids,  # 保存输入 token 缓冲区。
+            slot_mapping=slot_mapping, # 保存 KV 写入槽位缓冲区。
+            context_lens=context_lens, # 保存序列长度缓冲区。
+            block_tables=block_tables, # 保存逻辑块到物理块的映射缓冲区。
+            outputs=outputs, # 保存图的输出缓冲区。
         )
