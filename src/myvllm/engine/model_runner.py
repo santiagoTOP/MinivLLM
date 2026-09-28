@@ -45,6 +45,7 @@ class ModelRunner:
                     num_kv_heads=config['num_kv_heads'],
                     # rmsnorm 归一化时使用的参数
                     rms_norm_epsilon=config['rms_norm_epsilon'],
+                    # 计算qkv的时候是否加偏置，当前设置为false
                     qkv_bias=config['qkv_bias'],
                     # 用来调整位置编码的频率
                     base=config['base'],
@@ -354,6 +355,7 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
+            # 将当前batch序列中未被缓存部分的token ids 加入到一个inputs_ids 中去，通过后续的seqlens_q 来区分不同的序列
             input_ids.extend(token_ids[num_cached_tokens:])
             seqlens_q.append(len(token_ids) - num_cached_tokens)
             seqlens_k.append(len(token_ids))
@@ -408,7 +410,7 @@ class ModelRunner:
         slot_mappings = [] # 存储每个序列最后一个 token的物理缓存槽，这里的最后一个token 就是上一轮生成的，一轮每条序列产生一个 token
         block_tables = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
+            input_ids.append(seq.last_token) # 这里也是一个序列，序列的长度为batch_size，第 i 个元素对应 batch 中第 i 条序列
             context_lens.append(len(seq))
             # slot = 物理块编号 × 每块容量 + 块内偏移
             # 为每条序列的最后一个 token，计算它的 kv 应写入的物理缓存块

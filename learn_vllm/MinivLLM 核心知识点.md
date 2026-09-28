@@ -1,7 +1,7 @@
 # MinivLLM 核心知识点
 
 > 结合项目源码持续整理 MinivLLM 的核心概念、执行流程与实现细节。
-> 当前涵盖：请求调度、多进程驱动与通信、token 生成流程、KV Cache 与前缀缓存复用；后续继续补充其他知识点。
+> 当前涵盖：请求调度、多进程驱动与通信、token 生成流程、KV Cache 与前缀缓存复用、模型权重加载；后续继续补充其他知识点。
 
 ---
 
@@ -1448,7 +1448,111 @@ self.enforce_eager = config.get('enforce_eager', False)
 
 ---
 
-## 21. 核心要点速记
+## 21. 模型权重加载：从 Hugging Face checkpoint 到本地参数
+
+### 三个参与者及各自职责
+
+| 部分 | 保存或定义的内容 |
+|---|---|
+| Hugging Face checkpoint（`.safetensors`） | 训练好的张量数值，以及 `model.layers.0.self_attn.q_proj.weight` 这样的参数名（键） |
+| 本地 `Qwen3ForCausalLM` | 模块层级、参数形状和前向计算；例如本地使用 `qkv_projection` 合并 Q/K/V |
+| `load_weights_from_checkpoint` | 读取 checkpoint，按名称找到本地参数，必要时拼接权重，再把数值写入参数 |
+
+这里转换的是**权重的名称和布局**，不是把 Hugging Face 的模型代码转换过来。参数名是定位依据：PyTorch 会登记赋给 `nn.Module` 的子模块和 `nn.Parameter`，因此第 0 层 QKV 权重可以通过 `model.layers.0.self_attn.qkv_projection.weight` 找到。
+
+### 从建模到前向计算的完整链路
+
+```text
+ModelRunner 根据配置创建 Qwen3ForCausalLM
+  → Qwen3Attention 创建 qkv_projection
+  → LinearBase 用 torch.empty(...) 分配 self.weight
+  → 模型移到 GPU
+  → ModelRunner 调用 load_weights_from_checkpoint(...)
+  → 加载器读取 .safetensors 中的“参数名 → 张量”
+  → 按映射规则写入本地参数
+  → 前向时 self.qkv_projection(x) 使用已填好的 self.weight
+```
+
+`torch.empty(output_size, input_size)` **有形状，但数值未初始化**；`nn.Parameter` 使其成为模型参数。`self.weight.weight_loader = self.weight_loader` 只是把加载方法绑定到参数上，并没有立刻调用或填入权重。当前实际 checkpoint 加载流程主要直接执行 `param.data.copy_(...)`，并不使用这个绑定的方法。
+
+入口在 `src/myvllm/engine/model_runner.py`：构造模型并执行 `self.model.cuda(rank)` 后，调用 `load_weights_from_checkpoint(self.model, config['model_name_or_path'])`。实现位于 `src/myvllm/utils/loader.py`：解析本地路径或下载模型、逐个读取 `.safetensors` 文件，再遍历其中的参数名和张量。
+
+### 名称如何对应：直接复制与合并
+
+| checkpoint 中的名称（以第 0 层为例） | 本地目标名称 | 加载方式 |
+|---|---|---|
+| `model.layers.0.self_attn.q_proj.weight`、`k_proj.weight`、`v_proj.weight` | `model.layers.0.self_attn.qkv_projection.weight` | 按 Q、K、V 顺序沿输出维度 `dim=0` 拼接，三份变一份 |
+| `model.layers.0.mlp.gate_proj.weight`、`up_proj.weight` | `model.layers.0.mlp.gate_up.weight` | 按 gate、up 顺序沿 `dim=0` 拼接，两份变一份 |
+| `o_proj.weight`、`down_proj.weight`、归一化层权重等 | 与 checkpoint 同名的本地参数 | `model.get_parameter(hf_name)` 查找后直接复制 |
+
+以当前 `main.py` 中 Qwen3-0.6B 的配置为例：`hidden_size=1024`、Q 头数 16、KV 头数 8、`head_dim=128`。完整 Q/K/V 权重的形状分别为 `[2048, 1024]`、`[1024, 1024]`、`[1024, 1024]`；拼接后为 `[4096, 1024]`。加载器执行的关键步骤是：
+
+```python
+qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
+param = model.get_parameter(custom_name)
+param.data.copy_(qkv_weight)
+```
+
+`get_parameter` 沿模块名取得**已创建的那个参数对象**，`copy_` 原地填入数值，不会创建另一套权重。推理时 `Qwen3Attention.forward` 调用 `self.qkv_projection(x)`；该类继承 `ColumnParallelLinear.forward`，实际通过 `nn.functional.linear(x, self.weight, self.bias)` 计算，然后将输出拆成 Q、K、V。
+
+### `weight_loader`、`load_weight_id` 与当前实际路径
+
+`QKVColumnParallelLinear.weight_loader(param, loaded_weights, load_weight_id)` 设计为**逐份加载** Q、K、V：调用者必须传入 `'q'`、`'k'` 或 `'v'`，函数据此计算目标权重内的偏移及当前 rank 的分片。省略第三个参数去调用此方法，会先得到 Python 的 `TypeError`。
+
+当前 `load_weights_from_checkpoint` **没有调用**这个方法，也没有读取 `Qwen3ForCausalLM.packed_module_mapping`；它自己用硬编码的名称规则拼接 QKV 后直接 `copy_`。`linear.py` 中传入 `'q'`、`'k'`、`'v'` 的调用是该线性层的测试示例，不能据此认为真实 checkpoint 加载器也传了 `load_weight_id`。
+
+### `world_size=2` 时，参数形状已分片，加载流程却没有跟上
+
+`ColumnParallelLinear` 在创建参数前将输出维度除以 `tp_size`；`RowParallelLinear` 将输入维度除以 `tp_size`；`VocabParallelEmbedding` 按词表行数分配本 rank 的参数。**这只决定 `torch.empty(...)` 分配的局部形状，还没有把 checkpoint 权重按 rank 加载进去。**
+
+以 `main.py` 的 Qwen3-0.6B 配置为例：
+
+| 参数 | 官方完整权重 | `world_size=2` 时每个 rank 的参数 | 当前直接加载的后果 |
+|---|---|---|---|
+| `qkv_projection.weight` | 合并后 `[4096, 1024]` | `[2048, 1024]`，本 rank 包含 Q 1024 行、K 512 行、V 512 行 | 完整权重直接 `copy_` 到局部参数，形状不匹配 |
+| `gate_up.weight` | 合并后 `[6144, 1024]` | `[3072, 1024]`，本 rank 包含 gate 1536 行、up 1536 行 | 同样形状不匹配 |
+| `model.embed_tokens.weight` | `[151936, 1024]` | `[75968, 1024]` | 加载器的“形状不等则复制前 `min_size` 行”分支让**两个 rank 都得到前 75968 行**；没有报错也不正确 |
+| `o_proj.weight` | `[1024, 2048]` | `[1024, 1024]`，应沿输入维度 `dim=1` 切片 | 通用加载分支没有按 `dim=1` 分片，复制会形状不匹配 |
+
+`qkv_projection` 的复制错误会被 `loader.py` 外层 `except Exception` 记录；对应参数可能仍保留 `torch.empty` 的未初始化值。嵌入层更隐蔽：通用分支可能把错误的分片复制成功并标记为已加载。因此“没有报错”或“显示已加载”都不足以证明多卡权重正确。
+
+### 已实现的逐 rank 加载方法应该怎样接入
+
+每个 rank 都读取 checkpoint 中的**完整原始权重**，然后调用本 rank 参数绑定的 `weight_loader`。QKV 需要分别传入 Q、K、V 和标识符；不能先拼接成 `[Q 全部 | K 全部 | V 全部]`，再把整体简单对半切，因为每个 rank 所需布局是 `[Q 局部 | K 局部 | V 局部]`。
+
+```python
+param = model.get_parameter(f"model.layers.{layer_idx}.self_attn.qkv_projection.weight")
+param.weight_loader(param, q_weight, "q")
+param.weight_loader(param, k_weight, "k")
+param.weight_loader(param, v_weight, "v")
+```
+
+其他层要按各自方法加载：`MergedColumnParallelLinear.weight_loader` 对 gate/up 分别传整数 `0`/`1`；`RowParallelLinear.weight_loader` 沿权重的 `dim=1` 切片；`VocabParallelEmbedding.weight_loader` 按 rank 取不同的词表行，并对超出原词表的补齐行置零。对于当前 `tie_word_embeddings=True` 的 Qwen3 配置，`lm_head.weight` 与 `model.embed_tokens.weight` 指向同一参数对象，写入嵌入权重也就填入共享的语言头权重。
+
+可以参考 [nano-vllm 的加载器](https://github.com/GeeeekExplorer/nano-vllm/blob/main/nanovllm/utils/loader.py)：它读取模型的打包映射，将每份原始权重交给目标参数的 `weight_loader`，并传入对应的 shard ID。**不能原样复制到本项目**：本项目当前属性名是单数 `packed_module_mapping`，nano-vllm 读取复数 `packed_modules_mapping`；本项目实际模块名是 `qkv_projection`、`gate_up`，而当前映射中的目标名称也与它们不一致。若采用同样的接线方式，映射应与本地模块名一致：
+
+```python
+packed_modules_mapping = {
+    "q_proj": ("qkv_projection", "q"),
+    "k_proj": ("qkv_projection", "k"),
+    "v_proj": ("qkv_projection", "v"),
+    "gate_proj": ("gate_up", 0),
+    "up_proj": ("gate_up", 1),
+}
+```
+
+这只是**加载器接入方向**，不是已经完成的改动。除打包参数外，同名参数也要调用其专用 `weight_loader`；还应校验每个本地参数确实被加载、形状正确，并比较两卡与单卡的输出。若启用行并行层的 bias，现有本地 `RowParallelLinear.weight_loader` 也需要处理一维 bias，不能把权重的 `dim=1` 切片逻辑直接用于它。
+
+### 当前实现的边界
+
+- `main.py` 配置 `world_size=1`。合并后的完整权重与单卡参数形状一致；当 `world_size>1` 时，`QKVColumnParallelLinear` 的参数按 rank 缩小，但加载器仍尝试把完整拼接权重直接 `copy_` 进去，未走分片加载方法，不能据此认为多卡权重加载已正确实现。
+- 加载器会记录未加载或跳过的参数；复制出错会被捕获并记录，函数通常仍会打印汇总后返回。看到“加载函数返回”不等于所有参数都已正确写入；应检查未加载参数和跳过原因。
+- checkpoint 结构、配置值（如层数、头数、是否有 bias、是否共享 embedding 与 `lm_head`）必须与本地模型相符。名称能匹配只是第一步，形状和语义也要对应。
+
+---
+
+## 22. 核心要点速记
 
 1. `spawn` 启动子进程 = 全新解释器，不继承父进程 CUDA 状态（fork 会崩）。
 2. `ctx.Process()` 只是创建进程对象，`process.start()` 才真正启动；spawn 下参数走 pickle 序列化传递。
@@ -1472,3 +1576,4 @@ self.enforce_eager = config.get('enforce_eager', False)
 19. 当前空闲块匹配元数据被清除，“命中但未使用”的分支不可达；旧哈希键残留不代表可复用缓存仍有效。
 20. `torch.compile` 优化计算实现，可融合多个算子；CUDA Graph 捕获和重放执行流程以减少提交开销，两者可以独立或配合使用。
 21. 图重放仍会根据新输入重新计算；本项目的 `enforce_eager=True` 禁用模型显式图捕获与重放，但不关闭采样器的编译装饰器。
+22. 权重加载以 checkpoint 参数名为入口：当前单卡路径将 Q/K/V 合成 `qkv_projection`、gate/up 合成 `gate_up` 后直接复制；各层虽有按 rank 分片的 `weight_loader`，实际加载器没有调用。两卡时 QKV 等层会形状不匹配，嵌入层还可能在两个 rank 静默加载相同的前半词表。

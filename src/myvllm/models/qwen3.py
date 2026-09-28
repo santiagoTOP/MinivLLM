@@ -173,8 +173,11 @@ class Qwen3DecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
+        # 每一层的输入归一化层
         gamma = torch.ones(hidden_size)
         self.input_layernorm = LayerNorm(gamma)
+
+        # 每一层的自注意力层
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -187,7 +190,11 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=max_position,
             block_size=block_size,
         )
+
+        # 每一层的自注意力层后的归一化层
         self.post_attention_layernorm = LayerNorm(gamma)
+
+        # 每一层的MLP层，里面没有归一化层，对应的归一化层被提前到了post_attention_layernorm
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -247,10 +254,12 @@ class Qwen3Model(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
+        # 模型的词嵌入层，将输入的token ids 转换为隐藏状态
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=vocab_size,
             embedding_dim = hidden_size
         )
+        # 模型的层栈，每个层包含一个自注意力层和一个MLP层
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
@@ -267,6 +276,7 @@ class Qwen3Model(nn.Module):
                 block_size=block_size,
             ) for _ in range(num_layers)
         ])
+        # 模型的最终归一化层，将隐藏状态归一化到[-1, 1]之间
         gamma = torch.ones(hidden_size)
         self.norm = LayerNorm(gamma)
 
@@ -283,6 +293,7 @@ class Qwen3Model(nn.Module):
 # Qwen3ForCausalLM
 # add lm_head on top of Qwen3Model
 class Qwen3ForCausalLM(nn.Module):
+    # 权重加载器使用的映射规则，当前未被使用
     packed_module_mapping = {
         "q_proj": ('q_proj', 'q'),
         "k_proj": ('k_proj', 'k'),
@@ -310,6 +321,7 @@ class Qwen3ForCausalLM(nn.Module):
     ):
         super().__init__()
         head_dim = head_dim if head_dim is not None else hidden_size // num_heads
+        # 模型的主体部分
         self.model = Qwen3Model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -326,18 +338,22 @@ class Qwen3ForCausalLM(nn.Module):
             num_layers=num_layers,
             block_size=block_size,
         )
+        # 模型的语言头部分，主要是用来计算推理出的隐藏状态在词表中的概率分布
         self.lm_head = ParallelLMHead(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size
         )
+        # 如果需要将词嵌入和语言头的权重共享，那么就将语言头的权重设置为词嵌入的权重
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # 前向传播计算隐藏状态
         x = self.model(input_ids)
         return x 
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 计算隐藏状态在词表中的概率分布
         logits = self.lm_head(hidden_states)
         return logits
 
