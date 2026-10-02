@@ -110,6 +110,16 @@ class ColumnParallelLinear(LinearBase):
         return nn.functional.linear(x, self.weight, self.bias)
 
 # an extension of ColumnParallelLinear by merging several matrices
+# 将多个具有相同输入维度的线性投影合并，使每个进程用一次 F.linear 同时计算多个投影的本地输出。
+# 它继承父类的 forward：y = x @ weight.T + bias；主要新增各投影的大小记录和分段加载规则。
+# ColumnParallel 按输出特征分片：各进程接收相同的完整 x，输出不同特征，而不是切分 batch/token。
+# PyTorch 存储 weight 的形状是 [输出特征数, 输入特征数]，因此输出维度分片对应 weight 的行分片。
+# 例：input_size=2，output_sizes=[4, 4]（gate、up 各输出 4 维），tp_size=2，bias=False。
+# 完整权重 W_gate=[[1, 0], [0, 1], [1, 1], [2, 1]]，W_up=[[10, 0], [0, 10], [10, 10], [20, 10]]。
+# 本地权重布局是 [gate_local; up_local]，每个投影各占 4/2=2 行，整个 weight 形状为 [4, 2]。
+# rank 0 保存 [G0, G1, U0, U1]；rank 1 保存 [G2, G3, U2, U3]，G/U 分别代表 gate/up 的权重行。
+# 不能简单拼接完整 [G0,G1,G2,G3,U0,U1,U2,U3] 再均分，否则 rank 0 只有 gate，rank 1 只有 up。
+# 实际 Qwen3MLP 用 output_sizes=[intermediate_size, intermediate_size] 合并 gate_proj 和 up_proj。
 class MergedColumnParallelLinear(ColumnParallelLinear):
     def __init__(
         self, 
@@ -117,35 +127,65 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         output_sizes: list[int], # e.g. merge QKV matrices to compute MM together and then split
         bias: bool = True,
     ):
+        # input_size 是完整输入宽度；output_sizes 是各原始投影的完整输出宽度，不是本地分片宽度。
+        # 这里保存 [4, 4]，顺序决定本地参数/输出的布局，也决定 loaded_weight_id=0、1 的含义。
         self.output_sizes = output_sizes
+        # sum([4, 4])=8，父类再除以 tp_size=2，分配本地 weight [4, 2]。
+        # bias=True 时还分配本地 bias [4]；它的顺序同样是 [gate_bias_local; up_bias_local]。
+        # 父类将 self.weight_loader 挂到参数上；此时 self 是子类实例，因此绑定的是下面的分段加载方法。
+        # 正确使用要求每个 output_sizes[i] 都能整除 tp_size；当前父类仅检查总和能否整除，不做补齐。
         super().__init__(input_size, sum(output_sizes), bias)
+
+    # 没有重写 forward，所以 merged(x) 会调用 ColumnParallelLinear.forward，而不是在这里逐投影循环。
+    # 本例各进程输入 x=[[1, 2]]，形状 [1, 2]；一次 F.linear 得到本地 [1, 4] 输出：
+    #   rank 0：[[1, 2, 10, 20]]，前两列是 gate_local，后两列是 up_local。
+    #   rank 1：[[3, 4, 30, 40]]，例如 gate 第 3 个特征为 1*1+2*1=3，up 对应特征为 1*10+2*10=30。
+    # 对 N 个 token，输入/本地输出形状分别是 [N, 2]、[N, 4]；token 数不变，仅输出特征被分片。
+    # 本层 forward 不执行 gather 或 all_reduce，两个进程各自保留不同的本地结果。
+    # Qwen3MLP 的 SiluAndMul 将本地结果沿最后一维分成 gate/up 两半，再逐元素计算 SiLU(gate)*up。
+    # rank 0 处理全局特征 0、1，rank 1 处理特征 2、3；之后 down_proj 的行并行运算再汇总贡献。
+    # 如需还原完整输出，应先分别拼接各 rank 的 gate 和 up，再合并：[1,2,3,4,10,20,30,40]。
+    # 直接按 rank 拼接会变成 [1,2,10,20,3,4,30,40]，顺序不等于 [gate_all, up_all]。
 
     # param: parameter to be reloaded after tensor parallelism
     # loaded_weights: the original full parameter to be loaded into param
     # the index of merged matrices (e.g. it's 0 for Q, 1 for K, 2 for V assuming QKV are merged together)
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, loaded_weight_id: int):
         """
-        checkpoint = {
-            'q_proj.weight': torch.randn(4096, 4096),  
-            'k_proj.weight': torch.randn(4096, 4096),
-            'v_proj.weight': torch.randn(4096, 4096),
-        }
-        load to 
-        merged_layer = Linear(
-            input_size=4096,
-            output_sizes=sum([4096, 4096, 4096]),  # Q, K, V
-        ) which is also sharded by tp_size
+        将一个原始投影的完整权重或偏置切分，并写入当前进程的合并参数对应片段。
+
+        本例加载两个投影时，各进程分别调用：
+            merged = MergedColumnParallelLinear(2, [4, 4], bias=False)
+            merged.weight_loader(merged.weight, W_gate, loaded_weight_id=0)
+            merged.weight_loader(merged.weight, W_up, loaded_weight_id=1)
+
+        loaded_weights 是当前这一个投影的完整矩阵 [4, 2]，不是已合并的 [8, 2]。
+        loaded_weight_id 是投影在 output_sizes 中的索引，与当前进程的 tp_rank 不同。
         """
+        # 本地 param_data 的形状为 [4, 2]，但这次调用只更新其中 gate 或 up 的两行。
+        # weight 初始由 torch.empty 分配，所以两个投影都要正确加载后才能使用。
         param_data = param.data
         # compute offset 
+        # offset 是当前投影在“本地目标参数”中的起点，所有 rank 的本地布局相同：
+        #   id=0（gate）：sum([])/2=0；id=1（up）：sum([4])/2=2。
         offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
         # compute size
+        # 当前投影分给每个 rank 的行数：无论 gate 还是 up，本例 shard_size=4/2=2。
         shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
         # find the correct slice to be loaded in the sharded parameter
+        # narrow(0, offset, shard_size) 沿行维度取视图：gate 目标为 param[0:2]，up 目标为 param[2:4]。
+        # 这是原参数的视图，不是独立副本；后续 copy_ 会直接更新原始 weight 的对应两行。
         param_data = param_data.narrow(0, offset, shard_size)
         # shard the original full weight
+        # 源矩阵起点由 rank 决定：rank 0 从第 0 行取，rank 1 从第 2 行取。
+        # 注意与 offset 区分：offset 取决于投影 ID，loaded_weights_start_index 取决于进程 rank。
         loaded_weights_start_index = self.tp_rank * shard_size
+        # 若当前是 rank 1、id=1：从完整 W_up 中取第 2、3 行，shard_weights=[[10, 10], [20, 10]]。
         shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
+        # 将这两行写入 rank 1 的本地 weight[2:4]；gate 的 weight[0:2] 不受本次加载影响。
+        # 两次加载完成后，rank 1 的 weight=[[1, 1], [2, 1], [10, 10], [20, 10]]。
+        # 偏置也可用同一规则加载：传 param=merged.bias、完整 bias [4] 及对应投影 ID，目标视图为 [2]。
+        # 外部加载器必须显式提供 loaded_weight_id；给参数附加 weight_loader 不会自动执行这些加载调用。
         param_data.copy_(shard_weights)
 
 
